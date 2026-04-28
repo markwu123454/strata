@@ -34,7 +34,7 @@ from pathlib import Path
 
 # Bumped on each release. Read by the updater to compare against GitHub.
 # Keep in sync with pyproject.toml's `version`.
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.2.0"
 
 CONFIG_DIR = Path.home() / ".strata"
 CONFIG_FILE = CONFIG_DIR / "config.json"
