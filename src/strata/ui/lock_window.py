@@ -14,7 +14,11 @@ class LockConflictWindow(WebViewWindow):
     TITLE = "Session In Use"
     SIZE = (460, 320)
 
-    def __init__(self, app, lock_info: LockInfo):
+    def __init__(self, app, profile_name: str, lock_info: LockInfo):
+        # profile_name is which profile this lock belongs to. Carried so
+        # force_take_session can target the right engine — relevant now
+        # that the app holds multiple engines.
+        self.profile_name = profile_name
         self.lock_info = lock_info
         super().__init__(app)
 
@@ -23,11 +27,13 @@ class LockConflictWindow(WebViewWindow):
         device = _html.escape(info.device_name)
         when = _html.escape(info.acquired_at_str())
         age = info.age_minutes()
+        profile = _html.escape(self.profile_name)
 
         body = f"""
 <body style="padding:24px; align-items:center; text-align:center;">
   <div class="icon-large warn" style="margin-bottom:8px;">🔒</div>
   <h1 class="warn">Session Active on Another Device</h1>
+  <div class="muted" style="margin-top:2px;">Profile: {profile}</div>
 
   <div class="card" style="width:100%; margin-top:14px; text-align:left;">
     <div style="font-size:14px; font-weight:600;">{device}</div>
@@ -62,9 +68,9 @@ class LockConflictWindow(WebViewWindow):
         if action == "cancel":
             self.close()
         elif action == "force":
-            self.app.force_take_session()
+            self.app.force_take_session(self.profile_name)
             self.close()
 
     @classmethod
-    def open(cls, app, lock_info: LockInfo):
-        cls(app, lock_info)
+    def open(cls, app, profile_name: str, lock_info: LockInfo):
+        cls(app, profile_name, lock_info)

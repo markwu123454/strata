@@ -1,16 +1,15 @@
 """
 Layer 4: Sync engine
-Orchestrates Start Session and End Session.
+Orchestrates Start Session, End Session, and Quick Pull.
 This is the core of the application.
 """
 
 import time
-import shutil
 from pathlib import Path
 from dataclasses import dataclass, field
 from enum import Enum
 
-from strata.core.r2 import R2Client
+from strata.core.r2 import R2Client, R2Error
 from strata.core.manifest import Manifest, hash_file, hash_directory, find_out_of_session_changes, find_changed_files
 from strata.core.lock import LockManager, LockInfo
 
@@ -39,9 +38,7 @@ class OutOfSessionChange:
 @dataclass
 class StartSessionResult:
     success: bool
-    # If failed due to lock:
     lock_info: LockInfo | None = None
-    # If out-of-session changes detected:
     out_of_session_changes: list[OutOfSessionChange] = field(default_factory=list)
     error: str | None = None
 
@@ -51,6 +48,19 @@ class EndSessionResult:
     success: bool
     files_uploaded: int = 0
     files_deleted: int = 0
+    error: str | None = None
+
+
+@dataclass
+class QuickPullResult:
+    """Result of a Quick Pull (no-session download).
+
+    `lock_info` is informational only — Quick Pull does not honor or modify
+    the lock. If another device is mid-session, the caller may want to surface
+    that but Quick Pull itself proceeds either way.
+    """
+    success: bool
+    lock_info: LockInfo | None = None
     error: str | None = None
 
 
@@ -81,6 +91,11 @@ class SyncEngine:
         self.status = status
         self.on_status_change(status, message)
 
+    def _set_error(self, message: str):
+        """Set ERROR status and surface the message. Centralised so every
+        error path shows the same visual state."""
+        self._set_status(SyncStatus.ERROR, message)
+
     def _should_ignore(self, rel_path: str) -> bool:
         filename = Path(rel_path).name
         if filename in IGNORE:
@@ -93,20 +108,43 @@ class SyncEngine:
     def check_out_of_session_changes(self) -> list[OutOfSessionChange]:
         """Check for local changes made outside a session."""
         if not self.manifest.exists():
-            return []  # First time, no baseline
+            return []
         raw = find_out_of_session_changes(self.sync_dir, self.manifest, IGNORE)
         return [OutOfSessionChange(**c) for c in raw]
+
+    def peek_lock(self) -> LockInfo | None:
+        """Read the current lock without trying to acquire it.
+
+        Returns None if there's no lock OR if the read fails — a failed
+        read here isn't worth aborting a Quick Pull over, so we treat it
+        as "don't know" and proceed.
+        """
+        try:
+            return self.lock_manager.get_current_lock()
+        except R2Error:
+            return None
 
     def start_session(self, discard_local_changes: bool = False) -> StartSessionResult:
         """
         Start a session:
+        0. Connectivity check (fast-fail before acquiring lock)
         1. Check for out-of-session local changes
         2. Acquire lock
         3. Pull all files from R2
         """
-        self._set_status(SyncStatus.STARTING, "Checking local state...")
+        # Step 0: Connectivity check — do this before anything else so the
+        # user gets a clear error immediately on a restricted network instead
+        # of waiting for the lock acquire to time out and getting a
+        # cryptic boto3 message (or no message at all).
+        self._set_status(SyncStatus.STARTING, "Checking connection to R2...")
+        try:
+            self.r2.check_connectivity()
+        except R2Error as e:
+            self._set_error(str(e))
+            return StartSessionResult(success=False, error=str(e))
 
-        # Step 1: Check for out-of-session changes
+        # Step 1: Out-of-session changes
+        self._set_status(SyncStatus.STARTING, "Checking local state...")
         changes = self.check_out_of_session_changes()
         if changes and not discard_local_changes:
             self._set_status(SyncStatus.IDLE, "Out-of-session changes detected")
@@ -117,7 +155,12 @@ class SyncEngine:
 
         # Step 2: Acquire lock
         self._set_status(SyncStatus.STARTING, "Acquiring session lock...")
-        acquired, existing_lock = self.lock_manager.acquire()
+        try:
+            acquired, existing_lock = self.lock_manager.acquire()
+        except R2Error as e:
+            self._set_error(str(e))
+            return StartSessionResult(success=False, error=str(e))
+
         if not acquired:
             self._set_status(SyncStatus.IDLE, "Session locked by another device")
             return StartSessionResult(success=False, lock_info=existing_lock)
@@ -126,13 +169,24 @@ class SyncEngine:
         self._set_status(SyncStatus.SYNCING, "Pulling files from R2...")
         try:
             self._pull_all()
-        except Exception as e:
-            self.lock_manager.release()
-            self._set_status(SyncStatus.ERROR, str(e))
+        except R2Error as e:
+            # R2 problem mid-pull — release the lock so another device
+            # isn't blocked, then surface the error.
+            try:
+                self.lock_manager.release()
+            except Exception:
+                pass
+            self._set_error(str(e))
             return StartSessionResult(success=False, error=str(e))
+        except Exception as e:
+            try:
+                self.lock_manager.release()
+            except Exception:
+                pass
+            msg = f"Unexpected error during pull: {type(e).__name__}: {e}"
+            self._set_error(msg)
+            return StartSessionResult(success=False, error=msg)
 
-        # Write the local manifest so end_session has a baseline. Without this,
-        # the first end_session would re-upload every freshly-pulled file.
         current_hashes = hash_directory(self.sync_dir, IGNORE)
         self.manifest.save(current_hashes, self.device_id)
 
@@ -153,16 +207,18 @@ class SyncEngine:
 
         try:
             uploaded, deleted = self._push_changes()
-        except Exception as e:
-            self._set_status(SyncStatus.ERROR, str(e))
+        except R2Error as e:
+            self._set_error(str(e))
             return EndSessionResult(success=False, error=str(e))
+        except Exception as e:
+            msg = f"Unexpected error during upload: {type(e).__name__}: {e}"
+            self._set_error(msg)
+            return EndSessionResult(success=False, error=msg)
 
-        # Save manifest of current state
         self._set_status(SyncStatus.ENDING, "Saving state...")
         current_hashes = hash_directory(self.sync_dir, IGNORE)
         self.manifest.save(current_hashes, self.device_id)
 
-        # Release lock
         self.lock_manager.release()
         self._set_status(SyncStatus.IDLE, f"Session ended — {uploaded} uploaded, {deleted} deleted")
 
@@ -170,23 +226,62 @@ class SyncEngine:
 
     def force_take_session(self) -> StartSessionResult:
         """Force-break the lock and start a session. Requires user confirmation before calling."""
-        self.lock_manager.force_release()
+        try:
+            self.lock_manager.force_release()
+        except R2Error as e:
+            self._set_error(str(e))
+            return StartSessionResult(success=False, error=str(e))
         return self.start_session()
 
+    def quick_pull(self) -> QuickPullResult:
+        """Pull remote state into sync_dir without acquiring a lock.
+
+        Does NOT save the local manifest — the manifest must keep reflecting
+        the last actual session-end on this device. If we bumped it here,
+        local edits the user made before quick-pulling would silently
+        disappear from the next start_session's out-of-session-changes
+        detection.
+        """
+        # Connectivity check first — same reason as start_session.
+        self._set_status(SyncStatus.SYNCING, "Checking connection to R2...")
+        try:
+            self.r2.check_connectivity()
+        except R2Error as e:
+            self._set_error(str(e))
+            return QuickPullResult(success=False, error=str(e))
+
+        existing_lock = self.peek_lock()
+
+        self._set_status(SyncStatus.SYNCING, "Quick pull...")
+        try:
+            self._pull_all()
+        except R2Error as e:
+            self._set_error(str(e))
+            return QuickPullResult(success=False, error=str(e), lock_info=existing_lock)
+        except Exception as e:
+            msg = f"Unexpected error during pull: {type(e).__name__}: {e}"
+            self._set_error(msg)
+            return QuickPullResult(success=False, error=msg, lock_info=existing_lock)
+
+        self._set_status(SyncStatus.IDLE, "Quick pull complete")
+        return QuickPullResult(success=True, lock_info=existing_lock)
+
     def _pull_all(self):
-        """Download all files from R2, overwriting local versions."""
-        # Fetch manifest once up front for checksum verification
+        """Download all files from R2, overwriting local versions.
+
+        Raises R2Error if the remote manifest or file listing can't be
+        fetched. Individual file download failures are logged but don't
+        abort the pull — a partial pull is better than no pull when only
+        one file is flaky.
+        """
         remote_manifest = self.r2.get_json(REMOTE_MANIFEST_KEY) or {}
         remote_hashes = remote_manifest.get("files", {})
 
-        # Use manifest keys as source of truth (normalized forward-slash paths)
-        # Fall back to listing bucket if manifest is missing
         if remote_hashes:
             keys_to_pull = [k for k in remote_hashes if not self._should_ignore(k)]
         else:
             keys_to_pull = [k for k in self.r2.list_files() if not self._should_ignore(k)]
 
-        # Skip files already matching local hash — no need to re-download unchanged files
         def needs_download(key):
             local_path = self.sync_dir / Path(key)
             if not local_path.exists():
@@ -224,11 +319,9 @@ class SyncEngine:
                     tmp_path.unlink(missing_ok=True)
                     continue
 
-            # Atomic replace — use replace() not rename(), rename() fails on Windows if target exists
             local_path.parent.mkdir(parents=True, exist_ok=True)
             tmp_path.replace(local_path)
 
-        # Delete local files that no longer exist in R2
         if remote_hashes:
             for local_file in self.sync_dir.rglob("*"):
                 if not local_file.is_file():
@@ -241,7 +334,9 @@ class SyncEngine:
                     print(f"[Sync] Removed local file not in R2: {rel}")
 
     def _push_changes(self) -> tuple[int, int]:
-        """Upload changed files to R2. Returns (uploaded_count, deleted_count)."""
+        """Upload changed files to R2. Returns (uploaded_count, deleted_count).
+        Raises R2Error or RuntimeError on failure.
+        """
         current_hashes = hash_directory(self.sync_dir, IGNORE)
         last_hashes = self.manifest.get_all_hashes()
 
@@ -254,13 +349,10 @@ class SyncEngine:
             if last_hashes.get(rel_path) != current_hash:
                 to_upload.append(rel_path)
 
-        # Files in last manifest but gone locally → delete from R2
         for rel_path in last_hashes:
             if rel_path not in current_hashes:
                 to_delete.append(rel_path)
 
-        # Files in R2 but not in current local state and not in last manifest
-        # (e.g. test.txt uploaded manually, never tracked) → also delete
         remote_manifest = self.r2.get_json(REMOTE_MANIFEST_KEY) or {}
         for rel_path in remote_manifest.get("files", {}):
             if rel_path not in current_hashes and rel_path not in to_delete:
@@ -268,7 +360,6 @@ class SyncEngine:
 
         total = len(to_upload) + len(to_delete)
 
-        # Upload changed/new files
         for i, rel_path in enumerate(to_upload):
             self.on_progress(i + 1, total, rel_path)
             local_path = self.sync_dir / rel_path
@@ -278,12 +369,12 @@ class SyncEngine:
             if not ok:
                 raise RuntimeError(f"Failed to upload {rel_path}")
 
-        # Delete removed files from R2
         for i, rel_path in enumerate(to_delete):
             self.on_progress(len(to_upload) + i + 1, total, rel_path)
             self.r2.delete_file(rel_path)
 
-        # Update remote manifest
+        # put_json now raises R2Error on failure, so this will propagate
+        # cleanly up to end_session's error handler.
         self.r2.put_json(REMOTE_MANIFEST_KEY, {
             "files": current_hashes,
             "updated_at": time.time(),

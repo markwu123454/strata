@@ -1,6 +1,6 @@
 """
 Status window — opened from the tray icon. Shows current sync state and
-provides a primary action button.
+provides primary action buttons.
 
 Uses the shared WebViewWindow base so it inherits the same CSS, button
 styles, and JS bridge as the rest of the app's windows.
@@ -9,6 +9,10 @@ A 1-second timer pushes get_state() into the page. The engine also pushes
 state changes through callbacks, but the timer covers the case where the
 user opens the window mid-syncing — they should see live progress
 immediately.
+
+Multi-profile update: reads from app._active_engine() and
+app._active_profile_name() so it always reflects the currently-selected
+profile without needing to be rebuilt on profile switch.
 """
 from __future__ import annotations
 
@@ -30,7 +34,7 @@ STATUS_DISPLAY = {
 
 class StatusWindow(WebViewWindow):
     TITLE = "Strata"
-    SIZE = (440, 340)
+    SIZE = (460, 360)
 
     _instance: "StatusWindow | None" = None
 
@@ -71,6 +75,7 @@ class StatusWindow(WebViewWindow):
     <div class="row">
       <span id="dot" style="font-size:11px; transition:color .3s;">●</span>
       <span id="status-label" style="font-size:14px; font-weight:600;">Loading…</span>
+      <span id="profile-badge" class="muted" style="font-size:11px; margin-left:4px;"></span>
     </div>
     <div id="detail" class="muted"
          style="margin-top:4px; line-height:1.5; white-space:pre-line;"></div>
@@ -90,7 +95,9 @@ class StatusWindow(WebViewWindow):
   <div class="row" style="gap:8px;">
     <button id="action-btn" class="btn-primary" style="flex:1;"
             onclick="post('toggle')">Start Session</button>
-    <button id="folder-btn" class="btn-secondary" style="flex:0 0 110px;"
+    <button id="quick-pull-btn" class="btn-secondary" style="flex:0 0 100px;"
+            onclick="post('quick-pull')">Quick Pull</button>
+    <button id="folder-btn" class="btn-secondary" style="flex:0 0 100px;"
             onclick="post('open-folder')">Open Folder</button>
   </div>
 
@@ -102,6 +109,8 @@ function updateUI(state) {{
   document.getElementById("status-label").textContent = state.status_label;
   document.getElementById("detail").textContent       = state.detail;
   document.getElementById("path").textContent         = state.path;
+  document.getElementById("profile-badge").textContent =
+    state.profile_name ? "(" + state.profile_name + ")" : "";
 
   document.getElementById("progress-wrap")
     .classList.toggle("hidden", !state.show_progress);
@@ -112,6 +121,9 @@ function updateUI(state) {{
   // Swap variant class while preserving flex sizing.
   btn.className   = "btn-" + state.action_variant;
   btn.style.flex  = "1";
+
+  const qp = document.getElementById("quick-pull-btn");
+  qp.disabled = state.quick_pull_disabled;
 }}
 </script>
 </body>
@@ -128,6 +140,8 @@ function updateUI(state) {{
     def dispatch(self, action: str, payload):
         if action == "toggle":
             self.app._on_toggle_session(None)
+        elif action == "quick-pull":
+            self.app._on_quick_pull(None)
         elif action == "open-folder":
             self.app._on_open_folder(None)
 
@@ -136,10 +150,13 @@ function updateUI(state) {{
     def get_state(self) -> dict:
         app = self.app
         status = app._current_status
-        session_active = app._session_active
-        is_active = status in (
+        active_name = app._active_profile_name()
+        session_active = active_name in app._active_sessions
+        is_busy = status in (
             SyncStatus.SYNCING, SyncStatus.ENDING, SyncStatus.STARTING
         )
+
+        engine = app._active_engine()
 
         if status == SyncStatus.IDLE:
             if session_active:
@@ -166,15 +183,25 @@ function updateUI(state) {{
                 "Working…", "secondary", True
             )
 
+        # Quick Pull is available when: not busy, not in a session, engine ready.
+        quick_pull_disabled = (
+            is_busy
+            or session_active
+            or app._operation_in_progress
+            or engine is None
+        )
+
         return {
-            "dot_color":       dot_color,
-            "status_label":    label,
-            "detail":          detail,
-            "show_progress":   is_active,
-            "action_text":     action_text,
-            "action_variant":  action_variant,
-            "action_disabled": action_disabled,
-            "path":            str(app.engine.sync_dir) if app.engine else "",
+            "dot_color":           dot_color,
+            "status_label":        label,
+            "detail":              detail,
+            "show_progress":       is_busy,
+            "action_text":         action_text,
+            "action_variant":      action_variant,
+            "action_disabled":     action_disabled,
+            "quick_pull_disabled": quick_pull_disabled,
+            "path":                str(engine.sync_dir) if engine else "",
+            "profile_name":        active_name,
         }
 
     # ── Refresh tick ───────────────────────────────────────────────────────
