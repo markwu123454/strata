@@ -4,67 +4,45 @@ active session, since quitting leaves the lock held.
 """
 from __future__ import annotations
 
-import toga
-from toga.style import Pack
-from toga.style.pack import COLUMN, ROW
+from strata.ui._webview_base import WebViewWindow, SHARED_CSS, SHARED_JS
 
 
-class ConfirmQuitWindow:
-    def __init__(self, app):
-        self.app = app
+_HTML = """<!DOCTYPE html>
+<html><head><meta charset="utf-8"><style>__CSS__</style></head>
+<body style="padding:24px; align-items:center; text-align:center;">
+  <div class="icon-large warn" style="margin-bottom:8px;">⚠</div>
+  <h1 class="warn">Session still active</h1>
+  <p style="margin-top:8px;">
+    End your session before quitting<br>
+    to avoid leaving the lock open.
+  </p>
 
-        self.window = toga.Window(
-            title="Quit Strata",
-            size=(400, 200),
-            resizable=False,
-        )
-        self.window.content = self._build_content()
-        self.window.show()
+  <div class="spacer"></div>
+
+  <div class="actions" style="width:100%;">
+    <button class="btn-secondary" onclick="post('cancel')">Cancel</button>
+    <button class="btn-danger"    onclick="post('quit')">Quit Anyway</button>
+  </div>
+
+<script>__JS__</script>
+</body></html>
+""".replace("__CSS__", SHARED_CSS).replace("__JS__", SHARED_JS)
+
+
+class ConfirmQuitWindow(WebViewWindow):
+    TITLE = "Quit Strata"
+    SIZE = (400, 240)
+
+    def build_html(self) -> str:
+        return _HTML
+
+    def dispatch(self, action: str, payload):
+        if action == "cancel":
+            self.close()
+        elif action == "quit":
+            self.close()
+            self.app._do_quit()
 
     @classmethod
     def open(cls, app):
         cls(app)
-
-    def _build_content(self) -> toga.Box:
-        outer = toga.Box(style=Pack(direction=COLUMN, flex=1, padding=24, alignment="center"))
-
-        outer.add(
-            toga.Label(
-                "⚠ Session still active",
-                style=Pack(font_size=14, font_weight="bold", color="#b07a00"),
-            )
-        )
-        outer.add(
-            toga.Label(
-                "End your session before quitting\nto avoid leaving the lock open.",
-                style=Pack(font_size=12, color="#555", padding=(8, 0, 0, 0)),
-            )
-        )
-
-        outer.add(toga.Box(style=Pack(flex=1)))
-
-        btns = toga.Box(style=Pack(direction=ROW))
-        btns.add(toga.Box(style=Pack(flex=1)))
-        btns.add(
-            toga.Button(
-                "Cancel",
-                on_press=self._on_cancel,
-                style=Pack(width=100, padding=(0, 8, 0, 0)),
-            )
-        )
-        btns.add(
-            toga.Button(
-                "Quit Anyway",
-                on_press=self._on_quit,
-                style=Pack(width=120),
-            )
-        )
-        outer.add(btns)
-        return outer
-
-    def _on_cancel(self, widget):
-        self.window.close()
-
-    def _on_quit(self, widget):
-        self.window.close()
-        self.app._do_quit()
