@@ -36,7 +36,7 @@ from typing import Callable, Optional
 GITHUB_REPO = "markwu123454/strata"
 RELEASES_URL = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
 USER_AGENT = "Strata-Updater"
-CHECK_INTERVAL_SECONDS = 6 * 60 * 60  # every 6 hours
+CHECK_INTERVAL_SECONDS = 1 * 60 * 60  # every hour
 
 VERSION_RE = re.compile(r"^v?(\d+)\.(\d+)\.(\d+)$")
 
