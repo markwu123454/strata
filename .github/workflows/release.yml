@@ -5,9 +5,16 @@
 #          module in the running app discovers this asset via the
 #          /releases/latest API and offers it to users.
 #
-# Important: the tag version MUST match pyproject.toml [tool.briefcase].version
-# AND src/strata/config.py APP_VERSION. The "Verify version match" step below
-# fails the build if they drift, which is the bug you're going to hit otherwise.
+# Version reconciliation:
+#   The tag is the source of truth. If pyproject.toml or config.py don't
+#   match the tag, this workflow patches them, commits the fix, and
+#   force-moves the tag to the new commit — so the MSI is always built
+#   from source that agrees with the release version, without requiring a
+#   manual fixup push before retrying.
+#
+#   The commit is pushed to the branch the tag originally pointed at.
+#   If the tag was on a detached HEAD (tagged a commit not on any branch),
+#   the patch commit is pushed to main and the tag moved there.
 
 name: Release
 
@@ -17,13 +24,18 @@ on:
       - "v*.*.*"
 
 permissions:
-  contents: write  # required for softprops/action-gh-release to create releases
+  contents: write  # required for commits, tag force-push, and gh-release
 
 jobs:
   build-windows:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          # Fetch full history so we can determine the branch the tag is on
+          # and push the fixup commit back. fetch-depth: 0 also lets
+          # git describe work correctly if anything needs it.
+          fetch-depth: 0
 
       - uses: actions/setup-python@v5
         with:
@@ -34,25 +46,125 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install briefcase
 
-      - name: Verify version match
+      - name: Reconcile versions
+        id: versions
         shell: pwsh
         run: |
-          # Strip the leading 'v' from the tag and compare against the version
-          # baked into the source. Mismatches mean a user installs vX.Y.Z but
-          # the binary reports a different version — autoupdate would then
-          # offer the same release forever.
-          $tag = "${{ github.ref_name }}".TrimStart("v")
-          $pyproject = (Get-Content pyproject.toml -Raw)
-          if ($pyproject -notmatch 'version\s*=\s*"' + [regex]::Escape($tag) + '"') {
-            Write-Error "Tag $tag does not match pyproject.toml version"
+          # ── Derive the target version from the tag ──────────────────────
+          $tag     = "${{ github.ref_name }}"
+          $version = $tag.TrimStart("v")
+          Write-Host "Tag:     $tag"
+          Write-Host "Version: $version"
+
+          # ── Check each file ─────────────────────────────────────────────
+          $pyproject_content = Get-Content pyproject.toml -Raw
+          $config_content    = Get-Content src/strata/config.py -Raw
+
+          $pyproject_ok = $pyproject_content -match ('version\s*=\s*"' + [regex]::Escape($version) + '"')
+          $config_ok    = $config_content    -match ('APP_VERSION\s*=\s*"' + [regex]::Escape($version) + '"')
+
+          if ($pyproject_ok -and $config_ok) {
+            Write-Host "All versions match $version — no patch needed."
+            echo "patched=false" >> $env:GITHUB_OUTPUT
+            exit 0
+          }
+
+          # ── Patch mismatched files ──────────────────────────────────────
+          Write-Host "Version mismatch detected — patching to $version"
+
+          if (-not $pyproject_ok) {
+            Write-Host "  Patching pyproject.toml"
+            # Replace the first `version = "x.y.z"` line under [tool.briefcase]
+            # Uses a non-greedy match so it only touches the project version,
+            # not any dependency version pins that happen to appear in the file.
+            $pyproject_content = $pyproject_content -replace `
+              '(?m)^(version\s*=\s*")[^"]*(")', `
+              ('${1}' + $version + '${2}')
+            Set-Content pyproject.toml $pyproject_content -NoNewline
+          }
+
+          if (-not $config_ok) {
+            Write-Host "  Patching src/strata/config.py"
+            $config_content = $config_content -replace `
+              '(?m)^(APP_VERSION\s*=\s*")[^"]*(")', `
+              ('${1}' + $version + '${2}')
+            Set-Content src/strata/config.py $config_content -NoNewline
+          }
+
+          # ── Verify the patches actually worked ──────────────────────────
+          # Read back the files and confirm the pattern now matches.
+          # If the regex didn't find the right line, the replace is a no-op
+          # and we'd build with the wrong version — better to fail here.
+          $pyproject_check = (Get-Content pyproject.toml -Raw) -match `
+            ('version\s*=\s*"' + [regex]::Escape($version) + '"')
+          $config_check = (Get-Content src/strata/config.py -Raw) -match `
+            ('APP_VERSION\s*=\s*"' + [regex]::Escape($version) + '"')
+
+          if (-not $pyproject_check) {
+            Write-Error "Failed to patch pyproject.toml — check the version key format."
             exit 1
           }
-          $config = (Get-Content src/strata/config.py -Raw)
-          if ($config -notmatch 'APP_VERSION\s*=\s*"' + [regex]::Escape($tag) + '"') {
-            Write-Error "Tag $tag does not match config.py APP_VERSION"
+          if (-not $config_check) {
+            Write-Error "Failed to patch src/strata/config.py — check APP_VERSION format."
             exit 1
           }
-          Write-Host "Version $tag matches all sources"
+
+          echo "patched=true" >> $env:GITHUB_OUTPUT
+          Write-Host "Patch successful."
+
+      - name: Commit and retag if patched
+        if: steps.versions.outputs.patched == 'true'
+        shell: pwsh
+        run: |
+          $tag     = "${{ github.ref_name }}"
+          $version = $tag.TrimStart("v")
+
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # ── Figure out which branch to push the fixup to ────────────────
+          # `git branch -r --contains HEAD` lists all remote branches that
+          # contain the current commit. We prefer main/master; fall back to
+          # the first branch found; if none, push to main anyway and let
+          # the repo config decide whether that's allowed.
+          $branches = git branch -r --contains HEAD 2>$null |
+                      ForEach-Object { $_.Trim() -replace '^origin/', '' } |
+                      Where-Object { $_ -notmatch 'HEAD' }
+
+          $target_branch = $null
+          foreach ($b in @("main", "master")) {
+            if ($branches -contains $b) { $target_branch = $b; break }
+          }
+          if (-not $target_branch -and $branches) {
+            $target_branch = $branches | Select-Object -First 1
+          }
+          if (-not $target_branch) {
+            $target_branch = "main"
+            Write-Host "Tag not on any branch — pushing fixup to '$target_branch'"
+          } else {
+            Write-Host "Pushing fixup commit to branch '$target_branch'"
+          }
+
+          # ── Stage only the files we patched ────────────────────────────
+          git add pyproject.toml src/strata/config.py
+
+          git commit -m "chore: bump version to $version [skip ci]
+
+          Auto-patched by release workflow: tag $tag was pushed but
+          pyproject.toml and/or config.py still had the old version.
+          The tag has been force-moved to this commit."
+
+          # ── Push the fixup commit ───────────────────────────────────────
+          git push origin "HEAD:refs/heads/$target_branch"
+
+          # ── Force-move the tag to the new commit ────────────────────────
+          # The tag currently points at the pre-patch commit. We need it on
+          # the patched one so the release is built from correct source.
+          # --force is required because the tag already exists on the remote.
+          git tag --force $tag HEAD
+          git push origin --force "refs/tags/$tag"
+
+          Write-Host "Tag $tag force-moved to patched commit."
 
       - name: Briefcase create
         run: briefcase create windows
