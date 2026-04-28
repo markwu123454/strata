@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.venv/
+venv/
+.python-version
+
+# Briefcase
+build/
+dist/
+logs/
+
+# IDEs
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# Local config (user-specific, never commit)
+.env

@@ -1,0 +1,78 @@
+# Strata — Briefcase configuration (Toga-based)
+#
+# Build:
+#   briefcase create windows
+#   briefcase build windows
+#   briefcase package windows -p msi    # → dist/Strata-X.Y.Z.msi
+#
+# Toga ships in Briefcase's Windows support package, so unlike the previous
+# tkinter version we don't need to copy in DLLs. Just create + build + run.
+
+[tool.briefcase]
+project_name = "Strata"
+bundle = "org.markwu"
+version = "0.1.0"
+url = "https://github.com/markwu123454/strata"
+license.file = "LICENSE"
+author = "Mark Wu"
+author_email = "me@markwu.org"
+
+[tool.briefcase.app.strata]
+formal_name = "Strata"
+description = "Sync a directory between laptops via Cloudflare R2"
+long_description = """\
+Strata keeps a directory in sync between multiple computers using Cloudflare R2.
+Session-based locking means only one device can edit at a time, eliminating
+merge conflicts entirely.
+"""
+sources = ["src/strata"]
+test_sources = []
+
+# Toga is the GUI toolkit. The platform-specific backend (toga-winforms on
+# Windows, toga-cocoa on macOS, toga-gtk on Linux) is added per-platform below.
+requires = [
+    "boto3>=1.34.0",
+]
+
+# console_app=false → windowed launcher, no terminal flash. Right setting
+# for a tray app even though we're a "background" app — the launcher matters
+# for double-click from Start Menu.
+console_app = false
+
+# Multi-resolution .ico baked at the same path stem.
+icon = "src/strata/resources/strata"
+
+# ── macOS ─────────────────────────────────────────────────────────────────────
+[tool.briefcase.app.strata.macOS]
+universal_build = true
+requires = [
+    "toga-cocoa>=0.5.0",
+    "std-nslog~=1.0.3",
+]
+
+# ── Linux ─────────────────────────────────────────────────────────────────────
+[tool.briefcase.app.strata.linux]
+requires = [
+    "toga-gtk>=0.5.0",
+]
+
+[tool.briefcase.app.strata.linux.system.debian]
+system_requires = []
+system_runtime_requires = [
+    "libgirepository-1.0-1",
+    "gir1.2-gtk-3.0",
+    "libcairo2",
+]
+
+# ── Windows ───────────────────────────────────────────────────────────────────
+[tool.briefcase.app.strata.windows]
+# toga-winforms is the Windows backend — uses System.Windows.Forms via
+# pythonnet. Native controls, native theming, and (importantly) it ships in
+# the Briefcase Windows support package without any DLL juggling.
+requires = [
+    "toga-winforms>=0.5.0",
+]
+
+# Per-user install (no UAC). Required for the autoupdate flow — installer
+# runs without elevation, can replace the bundle in-place.
+use_full_install_path = false

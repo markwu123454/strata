@@ -1,0 +1,89 @@
+# Release workflow.
+#
+# Trigger: pushing a tag matching v*.*.* (e.g. `git tag v0.2.0 && git push --tags`).
+# Result:  a GitHub Release is created with the MSI attached. The updater
+#          module in the running app discovers this asset via the
+#          /releases/latest API and offers it to users.
+#
+# Important: the tag version MUST match pyproject.toml [tool.briefcase].version
+# AND src/strata/config.py APP_VERSION. The "Verify version match" step below
+# fails the build if they drift, which is the bug you're going to hit otherwise.
+
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write  # required for softprops/action-gh-release to create releases
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Briefcase
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install briefcase
+
+      - name: Verify version match
+        shell: pwsh
+        run: |
+          # Strip the leading 'v' from the tag and compare against the version
+          # baked into the source. Mismatches mean a user installs vX.Y.Z but
+          # the binary reports a different version — autoupdate would then
+          # offer the same release forever.
+          $tag = "${{ github.ref_name }}".TrimStart("v")
+          $pyproject = (Get-Content pyproject.toml -Raw)
+          if ($pyproject -notmatch 'version\s*=\s*"' + [regex]::Escape($tag) + '"') {
+            Write-Error "Tag $tag does not match pyproject.toml version"
+            exit 1
+          }
+          $config = (Get-Content src/strata/config.py -Raw)
+          if ($config -notmatch 'APP_VERSION\s*=\s*"' + [regex]::Escape($tag) + '"') {
+            Write-Error "Tag $tag does not match config.py APP_VERSION"
+            exit 1
+          }
+          Write-Host "Version $tag matches all sources"
+
+      - name: Briefcase create
+        run: briefcase create windows
+
+      - name: Briefcase build
+        run: briefcase build windows
+
+      - name: Briefcase package
+        # --adhoc-sign skips code signing. Replace with proper signing config
+        # once you have a code signing certificate — unsigned MSIs trigger
+        # SmartScreen warnings on download.
+        run: briefcase package windows --adhoc-sign
+
+      - name: Locate MSI
+        id: find_msi
+        shell: pwsh
+        run: |
+          $msi = Get-ChildItem -Path dist -Filter *.msi -Recurse | Select-Object -First 1
+          if (-not $msi) { Write-Error "No MSI produced"; exit 1 }
+          # Briefcase names it like "Strata-0.1.0.msi" — keep that, the updater
+          # pattern-matches on .msi extension only.
+          echo "msi_path=$($msi.FullName)" >> $env:GITHUB_OUTPUT
+          echo "msi_name=$($msi.Name)" >> $env:GITHUB_OUTPUT
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ steps.find_msi.outputs.msi_path }}
+          name: ${{ github.ref_name }}
+          generate_release_notes: true
+          # draft=false and prerelease=false so the updater (which filters out
+          # both) actually picks it up.
+          draft: false
+          prerelease: false

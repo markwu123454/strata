@@ -1,4 +1,4 @@
-# DirSync
+# Strata
 
 Sync a directory between laptops via Cloudflare R2. Session-based — only one
 device works at a time, eliminating merge conflicts entirely.
@@ -36,9 +36,9 @@ The other laptop can then Start Session and pull your changes.
 ## Project structure
 
 ```
-dirsync/
+strata/
   main.py                        # Entry point, tray icon
-  config.py                      # Config loading/saving (~/.dirsync/config.json)
+  config.py                      # Config loading/saving (~/.strata/config.json)
   requirements.txt
   core/
     r2.py                        # R2 client wrapper (boto3)
@@ -53,7 +53,7 @@ dirsync/
 
 ## Config file
 
-Stored at `~/.dirsync/config.json`. Edit manually or via Settings dialog.
+Stored at `~/.strata/config.json`. Edit manually or via Settings dialog.
 
 ```json
 {
@@ -63,7 +63,7 @@ Stored at `~/.dirsync/config.json`. Edit manually or via Settings dialog.
   "r2_access_key": "...",
   "r2_secret_key": "...",
   "r2_bucket": "my-sync-bucket",
-  "sync_dir": "/Users/you/DirSync"
+  "sync_dir": "/Users/you/Strata"
 }
 ```
 
