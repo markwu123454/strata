@@ -189,11 +189,14 @@ jobs:
           echo "msi_path=$($msi.FullName)" >> $env:GITHUB_OUTPUT
           echo "msi_name=$($msi.Name)" >> $env:GITHUB_OUTPUT
 
-      - name: Generate changelog
-        uses: orhun/git-cliff-action@v3
-        id: cliff
-        with:
-          args: --latest
+      - name: Install git-cliff
+        shell: pwsh
+        run: |
+          $version = "2.8.0"
+          $url = "https://github.com/orhun/git-cliff/releases/download/v$version/git-cliff-$version-x86_64-pc-windows-msvc.zip"
+          Invoke-WebRequest $url -OutFile git-cliff.zip
+          Expand-Archive git-cliff.zip -DestinationPath git-cliff-bin
+          echo "$PWD\git-cliff-bin" >> $env:GITHUB_PATH
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
