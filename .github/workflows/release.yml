@@ -189,13 +189,17 @@ jobs:
           echo "msi_path=$($msi.FullName)" >> $env:GITHUB_OUTPUT
           echo "msi_name=$($msi.Name)" >> $env:GITHUB_OUTPUT
 
+      - name: Generate changelog
+        uses: orhun/git-cliff-action@v3
+        id: cliff
+        with:
+          args: --latest
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           files: ${{ steps.find_msi.outputs.msi_path }}
           name: ${{ github.ref_name }}
-          generate_release_notes: true
-          # draft=false and prerelease=false so the updater (which filters out
-          # both) actually picks it up.
+          body: ${{ steps.cliff.outputs.content }}
           draft: false
           prerelease: false

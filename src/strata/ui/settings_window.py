@@ -4,19 +4,20 @@ plus device-level preferences.
 
 Layout:
   Left panel (180px): profile list with Add / Delete buttons
-  Right panel (flex): form for the selected profile
-  Bottom bar: Cancel / Save
+  Right panel (flex):  form for the selected profile
+  Bottom bar:          device settings + Cancel / Save
 
-The form is entirely in one WebView. The profile list is rendered as HTML
-<li> items — clicking one calls post('select', {name}) which re-renders
-the form panel via a JS updateForm() call pushed from Python.
-
-Folder picker: JS → Python → native dialog → JS round-trip (same as before).
+Profile switch fix: password fields (r2_secret_key) are not gathered on
+profile switch because browsers/WebViews may return empty string for
+password inputs read via JS. We only overwrite a credential field on
+switch if the value is non-empty, so existing secrets are preserved.
+On Save we always write what the form contains (user intentionally saved).
 """
 from __future__ import annotations
 
 import html as _html
 import json
+import copy
 
 import toga
 
@@ -36,10 +37,7 @@ class SettingsWindow(WebViewWindow):
     _instance: "SettingsWindow | None" = None
 
     def __init__(self, app):
-        # Deep-copy config so Cancel throws it away without touching live state.
-        import copy
         self.draft = copy.deepcopy(app.config)
-        # Which profile's form is currently shown in the right panel.
         profiles = self.draft.get("profiles", [])
         self.selected_profile = (
             self.draft.get("active_profile")
@@ -71,6 +69,32 @@ class SettingsWindow(WebViewWindow):
     def _profile_names(self) -> list[str]:
         return [p.get("name", "") for p in self.draft.get("profiles", [])]
 
+    def _apply_profile_form(self, form: dict, *, on_save: bool = False):
+        """Write profile form values into self.draft for the currently
+        selected profile.
+
+        on_save=False (profile switch): skip empty values so we don't clobber
+        stored credentials with empty strings returned by the WebView for
+        password fields. The profile name field is also ignored on switch —
+        renames only happen on explicit Save.
+
+        on_save=True: write all fields as-is (user deliberately saved).
+        """
+        p = self._profile_by_name(self.selected_profile)
+        if p is None:
+            return
+        for k in ("r2_account_id", "r2_bucket", "r2_access_key", "r2_secret_key", "sync_dir"):
+            if k not in form:
+                continue
+            v = form[k]
+            if on_save:
+                p[k] = v
+            else:
+                # On switch: only overwrite if non-empty, to protect secrets
+                # that the WebView may have blanked out for security.
+                if v:
+                    p[k] = v
+
     # ── HTML ───────────────────────────────────────────────────────────────
 
     def build_html(self) -> str:
@@ -82,30 +106,10 @@ class SettingsWindow(WebViewWindow):
         )
 
     def _build_body(self) -> str:
-        profiles = self.draft.get("profiles", [])
         selected = self.selected_profile
-
-        # ── Profile list sidebar ──
-        sidebar_items = []
-        for p in profiles:
-            name = p.get("name", "")
-            active_cls = "profile-item active" if name == selected else "profile-item"
-            badge = ""
-            # Mark which profile the engine considers "active" (the tray one),
-            # separately from the settings selection.
-            if name == self.draft.get("active_profile"):
-                badge = " <span class='badge'>active</span>"
-            sidebar_items.append(
-                f"<li class='{active_cls}' onclick=\"post('select', "
-                f"{{name:{json.dumps(name)}}})\"><span>{_html.escape(name)}</span>"
-                f"{badge}</li>"
-            )
-        sidebar_html = "\n".join(sidebar_items) or "<li class='muted' style='padding:8px;'>No profiles</li>"
-
-        # ── Per-profile form panel ──
+        sidebar_html = self._build_sidebar_items()
         form_html = self._build_form_panel(selected)
 
-        # ── Global preferences ──
         autostart_block = ""
         if autostart.is_supported():
             checked = "checked" if self.draft.get("autostart_enabled", False) else ""
@@ -131,7 +135,7 @@ class SettingsWindow(WebViewWindow):
       </ul>
       <div class="sidebar-footer">
         <button class="btn-secondary btn-sm" onclick="post('add_profile')">+ Add</button>
-        <button class="btn-danger btn-sm"    onclick="post('delete_profile', {{name:{json.dumps(selected)}}})">Delete</button>
+        <button class="btn-danger btn-sm" onclick="deleteSelected()">Delete</button>
       </div>
     </div>
 
@@ -151,11 +155,17 @@ class SettingsWindow(WebViewWindow):
 
     <h2>Preferences</h2>
     {autostart_block}
-    <label class="switch">
-      <input type="checkbox" id="f_check_for_updates" {updates_checked}>
-      <span class="track"></span>
-      <span>Automatically check for updates</span>
-    </label>
+    <div class="row" style="justify-content:space-between; align-items:center; padding:4px 0;">
+      <label class="switch" style="flex:1; margin:0;">
+        <input type="checkbox" id="f_check_for_updates" {updates_checked}>
+        <span class="track"></span>
+        <span>Automatically check for updates</span>
+      </label>
+      <button class="btn-secondary" id="check-update-btn"
+              style="font-size:11px; padding:4px 12px; white-space:nowrap;"
+              onclick="checkForUpdates()">Check Now</button>
+    </div>
+    <div id="update-status" class="muted" style="font-size:11px; margin-top:4px; min-height:14px;"></div>
 
     <div class="actions" style="margin-top:14px; margin-bottom:0;">
       <button class="btn-secondary" onclick="post('cancel')">Cancel</button>
@@ -165,6 +175,25 @@ class SettingsWindow(WebViewWindow):
 
 <script>
 __JS__
+
+// Track which profile name is currently shown so Delete/switch send the right one.
+let _selectedProfile = {json.dumps(selected)};
+
+// ── Delete ──────────────────────────────────────────────────────────────
+
+function deleteSelected() {{
+  post('delete_profile', {{ name: _selectedProfile }});
+}}
+
+// ── Profile switch ──────────────────────────────────────────────────────
+
+function selectProfile(name) {{
+  if (name === _selectedProfile) return;
+  // Gather the current form so Python can stash non-empty values before
+  // switching. Password fields may return empty string from the WebView —
+  // Python will skip overwriting them (see _apply_profile_form).
+  post('select', {{ name: name, current_form: gatherProfile() }});
+}}
 
 // ── Form gathering ──────────────────────────────────────────────────────
 
@@ -185,12 +214,30 @@ function gatherGlobals() {{
   const cu = document.getElementById("f_check_for_updates");
   if (cu) out.check_for_updates = cu.checked;
   const ae = document.getElementById("f_autostart_enabled");
-  if (ae) out.autostart_enabled = ae.checked; else out.autostart_enabled = false;
+  out.autostart_enabled = ae ? ae.checked : false;
   return out;
 }}
 
 function saveAll() {{
   post("save", {{ profile: gatherProfile(), globals: gatherGlobals() }});
+}}
+
+// ── Check for updates ───────────────────────────────────────────────────
+
+function checkForUpdates() {{
+  const btn = document.getElementById("check-update-btn");
+  const status = document.getElementById("update-status");
+  btn.disabled = true;
+  status.textContent = "Checking…";
+  status.className = "muted";
+  post('check_for_updates').then(() => {{
+    // Re-enable after a short delay — the actual result comes back via
+    // the tray update slot if a new version is found.
+    setTimeout(() => {{
+      btn.disabled = false;
+      status.textContent = "Done — if a new version is available, you'll see it in the tray.";
+    }}, 2000);
+  }});
 }}
 
 // ── Folder picker callback ──────────────────────────────────────────────
@@ -200,16 +247,16 @@ function setSyncDir(path) {{
   if (el) el.value = path;
 }}
 
-// ── Dynamic form update ────────────────────────────────────────────────
-// Called by Python after profile switch / add so we don't need a full
-// page reload.
+// ── Dynamic updates from Python ─────────────────────────────────────────
 
-function updateFormPanel(html) {{
+function updateFormPanel(html, newSelected) {{
   document.getElementById("form-panel").innerHTML = html;
+  if (newSelected !== undefined) _selectedProfile = newSelected;
 }}
 
-function updateProfileList(html) {{
+function updateProfileList(html, newSelected) {{
   document.getElementById("profile-list").innerHTML = html;
+  if (newSelected !== undefined) _selectedProfile = newSelected;
 }}
 </script>
 </body>
@@ -217,8 +264,6 @@ function updateProfileList(html) {{
         return body.replace("__JS__", SHARED_JS)
 
     def _build_form_panel(self, profile_name: str) -> str:
-        """Return the inner HTML for the right-hand form panel for the given
-        profile. Called both at initial render and on profile switch."""
         p = self._profile_by_name(profile_name)
         if p is None:
             if not self.draft.get("profiles"):
@@ -230,6 +275,19 @@ function updateProfileList(html) {{
 
         def field(key, label, password=False):
             t = "password" if password else "text"
+            # For password fields, use a placeholder instead of the real value
+            # so the WebView doesn't blank it out on read. The actual value is
+            # stored in self.draft and written to the file on Save.
+            if password:
+                stored = p.get(key, "")
+                # Show placeholder if value is set; show empty if not.
+                placeholder = "••••••••" if stored else ""
+                return f"""
+                  <label class="field-label">{label}</label>
+                  <input type="password" id="f_{key}" value=""
+                         placeholder="{_html.escape(placeholder)}"
+                         autocomplete="new-password">
+                """
             return f"""
               <label class="field-label">{label}</label>
               <input type="{t}" id="f_{key}" value="{val(key)}">
@@ -263,11 +321,16 @@ function updateProfileList(html) {{
         for p in self.draft.get("profiles", []):
             name = p.get("name", "")
             active_cls = "profile-item active" if name == selected else "profile-item"
-            badge = " <span class='badge'>active</span>" if name == self.draft.get("active_profile") else ""
+            badge = (
+                " <span class='badge'>active</span>"
+                if name == self.draft.get("active_profile") else ""
+            )
+            # json.dumps produces "name" with double quotes. The onclick
+            # attribute must use single quotes so the inner double quotes
+            # don't break the HTML parser.
             items.append(
-                f"<li class='{active_cls}' onclick=\"post('select', "
-                f"{{name:{json.dumps(name)}}})\"><span>{_html.escape(name)}</span>"
-                f"{badge}</li>"
+                f"<li class='{active_cls}' onclick='selectProfile({json.dumps(name)})'>"
+                f"<span>{_html.escape(name)}</span>{badge}</li>"
             )
         return "\n".join(items) or "<li class='muted' style='padding:8px;'>No profiles</li>"
 
@@ -279,18 +342,15 @@ function updateProfileList(html) {{
 
         elif action == "select":
             name = (payload or {}).get("name", "")
+            current_form = (payload or {}).get("current_form") or {}
             if name and self._profile_by_name(name) is not None:
-                # Flush any edits to the *current* form before switching.
-                # We don't have the form values here yet — we'll just mark
-                # the selection and push a fresh form. The user is warned
-                # via the Save button that unsaved edits to the previous
-                # profile's form are lost on switch (this is fine; they
-                # hit Save to commit).
+                # Stash current form (skipping empty password values).
+                self._apply_profile_form(current_form, on_save=False)
                 self.selected_profile = name
                 form_html = self._build_form_panel(name)
                 sidebar_html = self._build_sidebar_items()
-                self.eval_js(f"updateFormPanel({json.dumps(form_html)})")
-                self.eval_js(f"updateProfileList({json.dumps(sidebar_html)})")
+                self.eval_js(f"updateFormPanel({json.dumps(form_html)}, {json.dumps(name)})")
+                self.eval_js(f"updateProfileList({json.dumps(sidebar_html)}, {json.dumps(name)})")
 
         elif action == "add_profile":
             self._do_add_profile()
@@ -303,12 +363,13 @@ function updateProfileList(html) {{
             import asyncio
             asyncio.ensure_future(self._do_browse())
 
+        elif action == "check_for_updates":
+            self.app.check_for_updates()
+
         elif action == "save":
             self._do_save(payload or {})
 
     def _do_add_profile(self):
-        """Add a new blank profile, select it, and refresh the UI."""
-        # Find a unique name.
         existing = set(self._profile_names())
         base = "new-profile"
         name = base
@@ -328,29 +389,28 @@ function updateProfileList(html) {{
         self.selected_profile = name
         form_html = self._build_form_panel(name)
         sidebar_html = self._build_sidebar_items()
-        self.eval_js(f"updateFormPanel({json.dumps(form_html)})")
-        self.eval_js(f"updateProfileList({json.dumps(sidebar_html)})")
+        self.eval_js(f"updateFormPanel({json.dumps(form_html)}, {json.dumps(name)})")
+        self.eval_js(f"updateProfileList({json.dumps(sidebar_html)}, {json.dumps(name)})")
 
     def _do_delete_profile(self, name: str):
         profiles = self.draft.get("profiles", [])
+        if not name or self._profile_by_name(name) is None:
+            return
         if len(profiles) <= 1:
-            # Don't allow deleting the last profile — the app needs at
-            # least one to function. Show a brief status message instead.
             _msg = json.dumps(
                 "<p class='error' style='padding:24px;'>Cannot delete the last profile.</p>"
             )
             self.eval_js(f"updateFormPanel({_msg})")
             return
         self.draft["profiles"] = [p for p in profiles if p.get("name") != name]
-        # Fall back to the first remaining profile.
         remaining = self._profile_names()
         self.selected_profile = remaining[0] if remaining else ""
         if self.draft.get("active_profile") == name:
             self.draft["active_profile"] = self.selected_profile
         form_html = self._build_form_panel(self.selected_profile)
         sidebar_html = self._build_sidebar_items()
-        self.eval_js(f"updateFormPanel({json.dumps(form_html)})")
-        self.eval_js(f"updateProfileList({json.dumps(sidebar_html)})")
+        self.eval_js(f"updateFormPanel({json.dumps(form_html)}, {json.dumps(self.selected_profile)})")
+        self.eval_js(f"updateProfileList({json.dumps(sidebar_html)}, {json.dumps(self.selected_profile)})")
 
     async def _do_browse(self):
         import sys
@@ -383,28 +443,20 @@ function updateProfileList(html) {{
             pass
 
     def _do_save(self, form: dict):
-        """Merge form values into draft and save to disk."""
-        # ── Global fields ──
         globals_ = form.get("globals", {})
         if "device_name" in globals_:
             self.draft["device_name"] = globals_["device_name"]
         if "check_for_updates" in globals_:
             self.draft["check_for_updates"] = bool(globals_["check_for_updates"])
-        if "autostart_enabled" in globals_:
-            self.draft["autostart_enabled"] = bool(globals_["autostart_enabled"])
-        else:
-            self.draft["autostart_enabled"] = False
+        self.draft["autostart_enabled"] = bool(globals_.get("autostart_enabled", False))
 
-        # ── Active profile's form ──
         profile_form = form.get("profile", {})
         p = self._profile_by_name(self.selected_profile)
         if p is not None:
-            # Handle rename: the user may have changed profile_name.
             new_name = profile_form.get("profile_name", "").strip()
             old_name = self.selected_profile
             if new_name and new_name != old_name:
                 if not is_valid_profile_name(new_name):
-                    # Push a brief error and bail — don't save anything yet.
                     _err = json.dumps(
                         "<p class='error' style='padding:24px;'>"
                         "Profile name must contain only letters, digits, hyphens, and underscores."
@@ -421,15 +473,24 @@ function updateProfileList(html) {{
                     self.eval_js(f"updateFormPanel({_err})")
                     return
                 p["name"] = new_name
-                # If we were renaming the active_profile pointer, follow it.
                 if self.draft.get("active_profile") == old_name:
                     self.draft["active_profile"] = new_name
                 self.selected_profile = new_name
 
-            # Write the R2/sync_dir fields.
-            for k in ("r2_account_id", "r2_bucket", "r2_access_key", "r2_secret_key", "sync_dir"):
+            # on_save=True: write all fields including empty ones
+            # (user explicitly cleared a field).
+            # Exception: if secret key is empty AND we already have one stored,
+            # treat it as "unchanged" — the placeholder showed bullets so the
+            # user didn't intentionally clear it.
+            for k in ("r2_account_id", "r2_bucket", "r2_access_key", "sync_dir"):
                 if k in profile_form:
                     p[k] = profile_form[k]
+
+            # Secret key: only overwrite if the field isn't empty.
+            secret = profile_form.get("r2_secret_key", "")
+            if secret:
+                p["r2_secret_key"] = secret
+            # If empty and we have a stored value, keep the stored value.
 
         save_config(self.draft)
 
@@ -443,7 +504,7 @@ function updateProfileList(html) {{
         self.close()
 
 
-# ── Extra CSS for split layout ─────────────────────────────────────────────────
+# ── Extra CSS ──────────────────────────────────────────────────────────────────
 
 _EXTRA_CSS = """
   .split {
@@ -504,7 +565,7 @@ _EXTRA_CSS = """
   .sidebar-footer {
     display: flex;
     gap: 6px;
-    padding: 10px 10px;
+    padding: 10px;
     border-top: 1px solid #d2d2d7;
   }
   .btn-sm {
