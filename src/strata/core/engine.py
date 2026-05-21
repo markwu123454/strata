@@ -17,6 +17,7 @@ from strata.core.lock import LockManager, LockInfo
 # Files/dirs to never sync
 IGNORE = {".DS_Store", "Thumbs.db", "desktop.ini", "__pycache__"}
 IGNORE_PREFIXES = (".", "_sync/")
+IGNORE_SUFFIXES = (".tmp", "~")
 
 REMOTE_MANIFEST_KEY = "_sync/manifest.json"
 
@@ -103,13 +104,15 @@ class SyncEngine:
         for prefix in IGNORE_PREFIXES:
             if rel_path.startswith(prefix):
                 return True
+        if filename.endswith(IGNORE_SUFFIXES):
+            return True
         return False
 
     def check_out_of_session_changes(self) -> list[OutOfSessionChange]:
         """Check for local changes made outside a session."""
         if not self.manifest.exists():
             return []
-        raw = find_out_of_session_changes(self.sync_dir, self.manifest, IGNORE)
+        raw = find_out_of_session_changes(self.sync_dir, self.manifest, IGNORE, IGNORE_SUFFIXES)
         return [OutOfSessionChange(**c) for c in raw]
 
     def peek_lock(self) -> LockInfo | None:
@@ -124,13 +127,13 @@ class SyncEngine:
         except R2Error:
             return None
 
-    def start_session(self, discard_local_changes: bool = False) -> StartSessionResult:
+    def start_session(self, discard_local_changes: bool = False, skip_pull: bool = False) -> StartSessionResult:
         """
         Start a session:
         0. Connectivity check (fast-fail before acquiring lock)
         1. Check for out-of-session local changes
         2. Acquire lock
-        3. Pull all files from R2
+        3. Pull all files from R2 (skipped when user chose "keep local")
         """
         # Step 0: Connectivity check — do this before anything else so the
         # user gets a clear error immediately on a restricted network instead
@@ -165,7 +168,13 @@ class SyncEngine:
             self._set_status(SyncStatus.IDLE, "Session locked by another device")
             return StartSessionResult(success=False, lock_info=existing_lock)
 
-        # Step 3: Pull everything from R2
+        # Step 3: Pull everything from R2 (skipped when user chose "keep local")
+        if skip_pull:
+            current_hashes = hash_directory(self.sync_dir, IGNORE, IGNORE_SUFFIXES)
+            self.manifest.save(current_hashes, self.device_id)
+            self._set_status(SyncStatus.IDLE, "Session started")
+            return StartSessionResult(success=True)
+
         self._set_status(SyncStatus.SYNCING, "Pulling files from R2...")
         try:
             self._pull_all()
@@ -187,7 +196,7 @@ class SyncEngine:
             self._set_error(msg)
             return StartSessionResult(success=False, error=msg)
 
-        current_hashes = hash_directory(self.sync_dir, IGNORE)
+        current_hashes = hash_directory(self.sync_dir, IGNORE, IGNORE_SUFFIXES)
         self.manifest.save(current_hashes, self.device_id)
 
         self._set_status(SyncStatus.IDLE, "Session started")
@@ -216,7 +225,7 @@ class SyncEngine:
             return EndSessionResult(success=False, error=msg)
 
         self._set_status(SyncStatus.ENDING, "Saving state...")
-        current_hashes = hash_directory(self.sync_dir, IGNORE)
+        current_hashes = hash_directory(self.sync_dir, IGNORE, IGNORE_SUFFIXES)
         self.manifest.save(current_hashes, self.device_id)
 
         self.lock_manager.release()
@@ -337,7 +346,7 @@ class SyncEngine:
         """Upload changed files to R2. Returns (uploaded_count, deleted_count).
         Raises R2Error or RuntimeError on failure.
         """
-        current_hashes = hash_directory(self.sync_dir, IGNORE)
+        current_hashes = hash_directory(self.sync_dir, IGNORE, IGNORE_SUFFIXES)
         last_hashes = self.manifest.get_all_hashes()
 
         to_upload = []
