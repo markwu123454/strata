@@ -23,7 +23,7 @@ def hash_file(path: Path) -> str:
     return sha256.hexdigest()
 
 
-def hash_directory(directory: Path, ignore: set[str] = None) -> dict[str, str]:
+def hash_directory(directory: Path, ignore: set[str] = None, ignore_suffixes: tuple[str, ...] = ()) -> dict[str, str]:
     """
     Hash all files in a directory recursively.
     Returns dict of { relative_path_str: hash }
@@ -35,6 +35,8 @@ def hash_directory(directory: Path, ignore: set[str] = None) -> dict[str, str]:
             continue
         rel = path.relative_to(directory).as_posix()  # always forward slashes, cross-platform safe
         if rel in ignore or any(rel.startswith(i) for i in ignore):
+            continue
+        if ignore_suffixes and path.name.endswith(ignore_suffixes):
             continue
         try:
             hashes[rel] = hash_file(path)
@@ -94,6 +96,7 @@ def find_out_of_session_changes(
     directory: Path,
     manifest: Manifest,
     ignore: set[str] = None,
+    ignore_suffixes: tuple[str, ...] = (),
 ) -> list[dict]:
     """
     Compare current local files against last session manifest.
@@ -102,7 +105,7 @@ def find_out_of_session_changes(
     Each entry: { path, status }
     status: "modified" | "added" | "deleted"
     """
-    current_hashes = hash_directory(directory, ignore)
+    current_hashes = hash_directory(directory, ignore, ignore_suffixes)
     last_hashes = manifest.get_all_hashes()
     changes = []
 
@@ -126,12 +129,13 @@ def find_changed_files(
     directory: Path,
     manifest: Manifest,
     ignore: set[str] = None,
+    ignore_suffixes: tuple[str, ...] = (),
 ) -> list[str]:
     """
     Returns list of relative paths that changed since last session.
     Used during End Session to know what to upload.
     """
-    current_hashes = hash_directory(directory, ignore)
+    current_hashes = hash_directory(directory, ignore, ignore_suffixes)
     last_hashes = manifest.get_all_hashes()
     changed = []
 

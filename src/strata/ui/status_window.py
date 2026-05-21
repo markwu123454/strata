@@ -2,8 +2,9 @@
 Status window — shows all profiles simultaneously, each as its own card
 with live status and action buttons (Start/End Session, Quick Pull, Open Folder).
 
-The tick loop pushes the full profiles state every second. updateUI() in JS
-diffs by profile name and patches only changed cards, so it doesn't flicker.
+Button actions use data-action / data-name attributes on a single delegated
+click listener on the container, avoiding any quoting issues with profile
+names that contain characters special to HTML attributes or JS strings.
 """
 from __future__ import annotations
 
@@ -16,10 +17,10 @@ from strata.ui._webview_base import WebViewWindow, SHARED_CSS, SHARED_JS
 
 
 DOT_COLOR = {
-    "session":    "#1c7a45",  # green — session active, idle
-    "busy":       "#0a6dc2",  # blue  — downloading/uploading
-    "idle":       "#aaaaaa",  # grey  — no session
-    "error":      "#c2270a",  # red
+    "session": "#1c7a45",
+    "busy":    "#0a6dc2",
+    "idle":    "#aaaaaa",
+    "error":   "#c2270a",
 }
 
 
@@ -71,7 +72,7 @@ class StatusWindow(WebViewWindow):
 
   <div style="margin-top:10px; text-align:right;">
     <button class="btn-secondary" style="font-size:11px; padding:4px 12px;"
-            onclick="post('settings')">Settings…</button>
+            data-action="settings">Settings…</button>
   </div>
 
 <style>
@@ -81,27 +82,40 @@ class StatusWindow(WebViewWindow):
 <script>
 __JS__
 
-// Track rendered profile names so we know when to rebuild vs patch.
+// ── Event delegation ────────────────────────────────────────────────────
+// All buttons use data-action and data-name attributes.
+// One listener on document handles everything — no inline onclick with
+// profile names that could break HTML attribute quoting.
+
+document.addEventListener("click", function(e) {{
+  const btn = e.target.closest("[data-action]");
+  if (!btn || btn.disabled) return;
+  const action = btn.dataset.action;
+  const name   = btn.dataset.name || null;
+  if (action === "settings") {{
+    post("settings");
+  }} else if (name) {{
+    post(action, {{ name: name }});
+  }}
+}});
+
+// ── Rendering ───────────────────────────────────────────────────────────
+
 let _renderedProfiles = [];
 
 function updateUI(state) {{
   const profiles = state.profiles;
   const names = profiles.map(p => p.name);
 
-  // Full rebuild if profile list changed (added/removed/reordered).
   const same = names.length === _renderedProfiles.length &&
     names.every((n, i) => n === _renderedProfiles[i]);
 
   if (!same) {{
     renderAll(profiles);
-    _renderedProfiles = names;
+    _renderedProfiles = names.slice();
     return;
   }}
-
-  // Patch each existing card in place.
-  for (const p of profiles) {{
-    patchCard(p);
-  }}
+  for (const p of profiles) {{ patchCard(p); }}
 }}
 
 function renderAll(profiles) {{
@@ -114,36 +128,54 @@ function renderAll(profiles) {{
 }}
 
 function cardHTML(p) {{
-  const dot   = dotColor(p);
-  const label = statusLabel(p);
+  const dot    = dotColor(p);
+  const label  = statusLabel(p);
   const detail = p.message || "";
+  const id     = cssId(p.name);
 
-  const sessionBtn = p.session_active
-    ? `<button class="btn-danger btn-sm" onclick="post('toggle', {{name:${{JSON.stringify(p.name)}}}})">End Session</button>`
-    : `<button class="btn-primary btn-sm" onclick="post('toggle', {{name:${{JSON.stringify(p.name)}}}})">Start Session</button>`;
+  // Disabled states
+  const sesDisabled = (p.busy || p.op_in_progress) ? " disabled" : "";
+  const qpDisabled  = (p.busy || p.session_active || p.op_in_progress) ? " disabled" : "";
 
-  const qpDisabled  = p.busy || p.session_active || p.op_in_progress ? "disabled" : "";
-  const sesDisabled = p.busy || p.op_in_progress ? "disabled" : "";
+  // Session button — action and name go in data attributes, no quoting needed
+  const sessionAction = p.session_active ? "toggle" : "toggle";
+  const sessionClass  = p.session_active ? "btn-danger btn-sm" : "btn-primary btn-sm";
+  const sessionLabel  = p.session_active ? "End Session" : "Start Session";
 
+  const progressBar = p.busy
+    ? `<div class="progress-track" style="margin:6px 0 2px;">
+         <div class="progress-fill progress-indeterminate"></div>
+       </div>`
+    : "";
+
+  const detailRow = detail
+    ? `<div class="profile-detail muted">${{esc(detail)}}</div>`
+    : "";
+
+  // Profile name is placed in data-name. esc() only HTML-escapes for display;
+  // data attributes are set as text content so special chars are safe.
   return `
-    <div class="profile-card" id="card-${{cssId(p.name)}}">
+    <div class="profile-card" id="card-${{id}}">
       <div class="profile-card-header">
         <span class="dot" style="color:${{dot}}">●</span>
         <span class="profile-name">${{esc(p.name)}}</span>
         <span class="status-label">${{label}}</span>
       </div>
-      ${{detail ? `<div class="profile-detail muted">${{esc(detail)}}</div>` : ""}}
-      ${{p.busy ? `<div class="progress-track" style="margin:6px 0 2px;">
-        <div class="progress-fill progress-indeterminate"></div></div>` : ""}}
+      ${{detailRow}}
+      ${{progressBar}}
       <div class="profile-path muted">${{esc(p.sync_dir)}}</div>
       <div class="profile-actions">
-        <span ${{sesDisabled ? 'class="btn-wrap disabled"' : 'class="btn-wrap"'}}>
-          ${{sessionBtn.replace('>', sesDisabled ? ' disabled>' : '>')}}
-        </span>
-        <button class="btn-secondary btn-sm" ${{qpDisabled}}
-          onclick="post('quick-pull', {{name:${{JSON.stringify(p.name)}}}})">Quick Pull</button>
+        <button class="${{sessionClass}}"
+                data-action="toggle"
+                data-name="${{esc(p.name)}}"
+                ${{sesDisabled}}>${{sessionLabel}}</button>
         <button class="btn-secondary btn-sm"
-          onclick="post('open-folder', {{name:${{JSON.stringify(p.name)}}}})">Open Folder</button>
+                data-action="quick-pull"
+                data-name="${{esc(p.name)}}"
+                ${{qpDisabled}}>Quick Pull</button>
+        <button class="btn-secondary btn-sm"
+                data-action="open-folder"
+                data-name="${{esc(p.name)}}">Open Folder</button>
       </div>
     </div>`;
 }}
@@ -151,13 +183,12 @@ function cardHTML(p) {{
 function patchCard(p) {{
   const card = document.getElementById("card-" + cssId(p.name));
   if (!card) return;
-  // Replace the whole card — it's small and the flicker is imperceptible.
   card.outerHTML = cardHTML(p);
 }}
 
 function dotColor(p) {{
-  if (p.error) return "{DOT_COLOR['error']}";
-  if (p.busy)  return "{DOT_COLOR['busy']}";
+  if (p.error)          return "{DOT_COLOR['error']}";
+  if (p.busy)           return "{DOT_COLOR['busy']}";
   if (p.session_active) return "{DOT_COLOR['session']}";
   return "{DOT_COLOR['idle']}";
 }}
@@ -170,7 +201,6 @@ function statusLabel(p) {{
 }}
 
 function cssId(name) {{
-  // Strip chars that break CSS id selectors.
   return name.replace(/[^a-zA-Z0-9_-]/g, "_");
 }}
 
@@ -223,7 +253,6 @@ function esc(s) {{
             busy = status in (SyncStatus.STARTING, SyncStatus.SYNCING, SyncStatus.ENDING)
             error = status == SyncStatus.ERROR
 
-            # Status text shown next to the dot while busy.
             status_text_map = {
                 SyncStatus.STARTING: "Starting…",
                 SyncStatus.SYNCING:  "Downloading…",
@@ -304,6 +333,4 @@ _EXTRA_CSS = """
     font-size: 11px;
     padding: 4px 10px;
   }
-  .btn-wrap { display: contents; }
-  .btn-wrap.disabled button { opacity: 0.5; cursor: not-allowed; }
 """
