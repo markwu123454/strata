@@ -463,11 +463,6 @@ class StrataApp(toga.App):
             self._marshal(self._refresh_menu)
             try:
                 keep_local = not discard and changes is not None
-                if keep_local:
-                    from strata.core.manifest import hash_directory
-                    from strata.core.engine import IGNORE, IGNORE_SUFFIXES
-                    current_hashes = hash_directory(engine.sync_dir, IGNORE, IGNORE_SUFFIXES)
-                    engine.manifest.save(current_hashes, self.config["device_id"])
                 result = engine.start_session(discard_local_changes=discard, skip_pull=keep_local)
                 if result.success:
                     self._active_sessions.add(profile_name)

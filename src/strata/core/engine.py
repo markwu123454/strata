@@ -147,14 +147,18 @@ class SyncEngine:
             return StartSessionResult(success=False, error=str(e))
 
         # Step 1: Out-of-session changes
-        self._set_status(SyncStatus.STARTING, "Checking local state...")
-        changes = self.check_out_of_session_changes()
-        if changes and not discard_local_changes:
-            self._set_status(SyncStatus.IDLE, "Out-of-session changes detected")
-            return StartSessionResult(
-                success=False,
-                out_of_session_changes=changes,
-            )
+        # skip_pull means the user already acknowledged the conflict and chose
+        # "keep local" — no need to re-detect, and we must NOT update the
+        # manifest here so end_session can still see those changes as "new".
+        if not skip_pull:
+            self._set_status(SyncStatus.STARTING, "Checking local state...")
+            changes = self.check_out_of_session_changes()
+            if changes and not discard_local_changes:
+                self._set_status(SyncStatus.IDLE, "Out-of-session changes detected")
+                return StartSessionResult(
+                    success=False,
+                    out_of_session_changes=changes,
+                )
 
         # Step 2: Acquire lock
         self._set_status(SyncStatus.STARTING, "Acquiring session lock...")
@@ -170,8 +174,8 @@ class SyncEngine:
 
         # Step 3: Pull everything from R2 (skipped when user chose "keep local")
         if skip_pull:
-            current_hashes = hash_directory(self.sync_dir, IGNORE, IGNORE_SUFFIXES)
-            self.manifest.save(current_hashes, self.device_id)
+            # Keep the old manifest intact so end_session sees the out-of-session
+            # changes as "made during session" and uploads them normally.
             self._set_status(SyncStatus.IDLE, "Session started")
             return StartSessionResult(success=True)
 
